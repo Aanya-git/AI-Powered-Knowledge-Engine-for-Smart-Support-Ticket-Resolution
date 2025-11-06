@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# Virtual Environment
+venv/
+
+# Sensitive Data/API Keys (CRITICAL!)
+.env
+.DS_Store
+
+# Streamlit specifics (logs/local cache)
+.streamlit/
