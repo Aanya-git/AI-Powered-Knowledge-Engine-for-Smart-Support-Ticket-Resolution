@@ -1,0 +1,17 @@
+langchain-community
+langchain
+
+# PDF Processing (Handles text, images/OCR, and tables)
+unstructured
+
+# Vector Database
+chromadb
+
+# Embedding Model (Use a recommended open-source alternative for now)
+sentence-transformers
+
+# Utility for managing secrets
+python-dotenv
+
+# Optional (Good for local testing)
+ipykernel
