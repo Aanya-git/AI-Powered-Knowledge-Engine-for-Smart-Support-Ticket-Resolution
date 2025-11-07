@@ -50,20 +50,34 @@ def load_documents():
     print(f"Total document segments loaded: {len(documents)}")
     return documents
 
-# --- 2. Chunking Function ---
+# --- 2. Semantic Chunking Function ---
 def split_documents(documents: list):
     """
-    Splits large documents into smaller, overlapping chunks (the 'chunker' in your diagram).
+    Splits documents into semantically meaningful chunks using a combination of
+    structural and semantic boundaries while maintaining context.
     """
-    # RecursiveTextSplitter is robust and preserves structure better than simpler methods
+    # Use a semantic text splitter that respects sentence and paragraph boundaries
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,   # Recommended chunk size for RAG context
-        chunk_overlap=200, # Ensures context isn't lost at the boundaries
-        separators=["\n\n", "\n", " ", ""] # Splits on logical breaks
+        chunk_size=500,          # Smaller chunks for more semantic coherence
+        chunk_overlap=50,        # Minimal overlap to maintain context
+        length_function=len,     # Standard length calculation
+        separators=[            # Ordered by semantic significance
+            "\n## ",           # Section headings
+            "\n### ",          # Subsection headings
+            "\n\n",           # Paragraphs
+            "\n",             # Line breaks
+            ". ",             # Sentences
+            "? ",             # Questions
+            "! ",             # Exclamations
+            ", ",             # Clauses
+            " ",              # Words
+            ""                # Characters
+        ],
+        is_separator_regex=False
     )
     
     chunks = text_splitter.split_documents(documents)
-    print(f"Created {len(chunks)} chunks for embedding.")
+    print(f"Created {len(chunks)} semantic chunks for embedding.")
     return chunks
 
 # --- 3. Embedding and Indexing Function ---
