@@ -1,0 +1,4 @@
+text,expected_category
+"Payment failed while booking movie tickets","Payment Issue"
+"Refund not received for cancelled event","Refund Request"
+"Unable to login to my account","Account Related"
