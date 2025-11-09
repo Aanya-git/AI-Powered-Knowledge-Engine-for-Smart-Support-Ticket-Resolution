@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 # --- RAG Core Libraries ---
 # Used for document loading and advanced splitting
 from langchain_community.document_loaders import UnstructuredFileLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 # ChromaDB is your Vector Database
 from langchain_community.vectorstores import Chroma
 # sentence-transformers is the recommended local Embedding Model
