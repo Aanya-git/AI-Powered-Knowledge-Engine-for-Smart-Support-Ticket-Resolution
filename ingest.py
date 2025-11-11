@@ -5,79 +5,87 @@ from dotenv import load_dotenv
 from langchain_community.document_loaders import UnstructuredFileLoader
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_community.vectorstores import Chroma
+from langchain_openai import OpenAIEmbeddings
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
+# Load .env
 load_dotenv()
 
-DATA_PATH = "data"
-CHROMA_PATH = "chroma_db"
+# Paths
+DATA_PATH = os.getenv("DATA_PATH", "data")
+CHROMA_PATH = os.getenv("CHROMA_PATH", "chroma_db")
+
+# OpenRouter Keys
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://openrouter.ai/api/v1")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "google/text-embedding-004")  # Gemini embedding model
 
 def load_documents():
-    """Load all documents from DATA_PATH and extract structured content."""
-    print(f"\n Loading documents from '{DATA_PATH}'...")
+    """Load documents from /data folder"""
+    print(f"\nLoading documents from '{DATA_PATH}'...")
 
+    docs = []
     if not os.path.exists(DATA_PATH):
-        print(f"  Data directory '{DATA_PATH}' not found. Please create it and add files.")
+        os.makedirs(DATA_PATH)
+        print(f"DATA folder was missing — created '{DATA_PATH}'. Place files and run again.")
         return []
 
-    documents = []
     for filename in os.listdir(DATA_PATH):
         filepath = os.path.join(DATA_PATH, filename)
-        if os.path.isfile(filepath) and not filename.startswith('.'):
-            try:
-                loader = UnstructuredFileLoader(filepath)
-                docs = loader.load()
-                for doc in docs:
-                    doc.metadata["source"] = filename
-                documents.extend(docs)
-                print(f" Loaded {len(docs)} segments from {filename}")
-            except Exception as e:
-                print(f" Error loading {filename}: {e}")
-    print(f" Total documents loaded: {len(documents)}")
-    return documents
+        if os.path.isfile(filepath) and not filename.startswith("."):
+            loader = UnstructuredFileLoader(filepath)
+            file_docs = loader.load()
+            for d in file_docs:
+                d.metadata["source"] = filename
+            docs.extend(file_docs)
+            print(f" Loaded {len(file_docs)} chunks from {filename}")
+
+    print(f"Total text chunks extracted: {len(docs)}")
+    return docs
 
 
-def split_documents_semantic(documents):
-    """Split documents semantically using embeddings similarity."""
-    print("\n Splitting documents semantically...")
+def split_documents_semantic(docs):
+    """Semantic chunker (MiniLM for chunking logic)"""
+    print("\nSplitting documents into semantic chunks...")
 
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    hf_embedder = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    chunker = SemanticChunker(hf_embedder)
 
-    text_splitter = SemanticChunker(embeddings, breakpoint_threshold_type="percentile", breakpoint_threshold_amount=90)
-    # You can tune breakpoint_threshold_amount (lower = smaller chunks, higher = larger semantic chunks)
-
-    chunks = text_splitter.split_documents(documents)
-    print(f" Created {len(chunks)} semantically coherent chunks.")
+    chunks = chunker.split_documents(docs)
+    print(f"Created {len(chunks)} meaningful chunks")
     return chunks
 
 
 def index_documents(chunks):
-    """Embed text and store it in ChromaDB."""
-    print("\n Creating and storing embeddings in ChromaDB...")
+    """Create embeddings using Gemini via OpenRouter & store in Chroma"""
+    print("\nGenerating embeddings via Gemini (OpenRouter)...")
 
+    # Remove old DB
     if os.path.exists(CHROMA_PATH):
         shutil.rmtree(CHROMA_PATH)
-        print(" Old ChromaDB removed for fresh indexing.")
+        print("Old vector DB deleted.")
 
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
-    Chroma.from_documents(
-        chunks,
-        embeddings,
-        persist_directory=CHROMA_PATH,
+    # Embedding engine (Gemini via OpenRouter)
+    embeddings = OpenAIEmbeddings(
+        model=EMBED_MODEL,
+        openai_api_key=OPENAI_API_KEY,
+        openai_api_base=OPENAI_API_BASE
     )
 
-    print(f" Indexed {len(chunks)} chunks in ChromaDB at '{CHROMA_PATH}'.")
+    Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        persist_directory=CHROMA_PATH
+    )
+
+    print(f"Indexed {len(chunks)} chunks into Chroma DB at '{CHROMA_PATH}'")
 
 
 if __name__ == "__main__":
-    print("\n Starting Semantic Document Ingestion Pipeline...")
-    if not os.path.exists(DATA_PATH):
-        os.makedirs(DATA_PATH)
-        print(f" Created '{DATA_PATH}'. Add your documents and rerun.")
-    else:
-        docs = load_documents()
-        if docs:
-            chunks = split_documents_semantic(docs)
-            index_documents(chunks)
-            print("\n Ingestion complete! Vector DB ready for RAG use.")
+    print("\nStarting Knowledge Base Builder...")
+
+    documents = load_documents()
+    if documents:
+        chunks = split_documents_semantic(documents)
+        index_documents(chunks)
+        print("\nKnowledge Base successfully created! RAG is ready.")
