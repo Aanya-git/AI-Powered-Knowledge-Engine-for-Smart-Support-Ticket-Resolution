@@ -1,13 +1,10 @@
-import os
-from dotenv import load_dotenv
-from openai import OpenAI
+# classify.py
+from llm_utils import groq_chat_completion
+from config import GROQ_CLASSIFY_MODEL
+from typing import List
 
-# Load API key from .env file
-load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# Ticket categories
-INTENT_CATEGORIES = [
+# Predefined categories for BookMyShow support
+INTENT_CATEGORIES: List[str] = [
     "Payment Issue",
     "Ticket Booking Issue",
     "Refund Request",
@@ -16,36 +13,41 @@ INTENT_CATEGORIES = [
     "General Query / Other"
 ]
 
-def classify_ticket(text):
-    prompt = f"""
-You are a BookMyShow support ticket intent classifier.
-Classify the message into one of these categories:
+def classify_ticket(text: str) -> str:
+    """
+    Classify the ticket text into one category from INTENT_CATEGORIES.
+    Returns the category name (string).
+    """
+    if not text or not text.strip():
+        return "General Query / Other"
 
-{INTENT_CATEGORIES}
-
-User Query: "{text}"
-
-Return ONLY the category name.
-"""
-
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": prompt}
-        ]
+    system_prompt = (
+        "You are a BookMyShow support ticket intent classifier. "
+        "Classify the user's message into ONE of the categories below and RETURN ONLY the category name.\n\n"
+        f"{INTENT_CATEGORIES}\n\n"
+        "If none match exactly, return 'General Query / Other'. Do not add extra text or explanation."
     )
-    return response.choices[0].message.content.strip()
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": text}
+    ]
+
+    try:
+        resp = groq_chat_completion(messages, model="llama-3.3-8b-instant", max_tokens=32, temperature=0.0)
+        category = resp.strip().strip('"').strip()
+        if category not in INTENT_CATEGORIES:
+            return "General Query / Other"
+        return category
+    except Exception as e:
+        # On error, fallback to a safe default (so pipeline doesn't crash)
+        return "General Query / Other"
+
 
 if __name__ == "__main__":
-    print("BookMyShow Ticket Classification System")
-    print("Type 'exit' to stop\n")
-
+    print("Classifier (Groq)")
     while True:
-        text = input("Enter customer ticket text: ")
-
-        if text.lower() == "exit":
-            print("\n Exiting classifier...")
+        t = input("Ticket text ('exit' to quit): ")
+        if t.lower() == "exit":
             break
-        
-        category = classify_ticket(text)
-        print(f" Predicted Category: {category}\n")
+        print("Predicted ->", classify_ticket(t))

@@ -40,6 +40,4 @@ build/
 dist/
 *.egg-info/
 
-# Explicitly ignore files you don't want to push
-app.py
-feedback_trainer.py
+
