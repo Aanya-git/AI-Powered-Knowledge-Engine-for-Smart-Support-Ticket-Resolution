@@ -1,12 +1,45 @@
+# Byte-compiled / cache files
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# Virtual Environment
+# Virtual environments
 venv/
+myenv/
 
-# Sensitive Data/API Keys (CRITICAL!)
+# Environment and system files
 .env
 .DS_Store
+Thumbs.db
 
-# Streamlit specifics (logs/local cache)
+# Streamlit cache and logs
 .streamlit/
+.streamlit-cache/
+
+# IDE settings
+.vscode/
+.idea/
+
+# Vector database / Chroma files
+chroma_db/
+*.sqlite3
+*.bin
+*.pickle
+*.pkl
+
+# Local data folders
+data/
+datasets/
+outputs/
+logs/
+*.log
+
+# Build / dist artifacts
+build/
+dist/
+*.egg-info/
+
+# Explicitly ignore files you don't want to push
+app.py
+feedback_trainer.py
