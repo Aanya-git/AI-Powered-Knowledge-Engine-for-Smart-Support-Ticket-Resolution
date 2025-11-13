@@ -1,81 +1,114 @@
-from classify import classify_ticket  #classifier
-from ingest import Chroma, HuggingFaceEmbeddings  #DB + embeddings
-from dotenv import load_dotenv
+# rag_app.py
 import os
+import chromadb
+from sentence_transformers import SentenceTransformer
+from config import CHROMA_PATH, EMBED_MODEL, GROQ_RAG_MODEL, GROQ_FALLBACK_MODEL
+from llm_utils import groq_chat_completion
 
-load_dotenv()
+# Embedding model for query embeddings
+embedder = SentenceTransformer(EMBED_MODEL)
 
-#Load Vector DB
-CHROMA_PATH = "chroma_db"
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-db = Chroma(persist_directory=CHROMA_PATH, embedding_function=embeddings)
+# Initialize Chroma client (support different chromadb versions)
+try:
+    chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+except Exception:
+    from chromadb.config import Settings
+    chroma_client = chromadb.Client(Settings(persist_directory=CHROMA_PATH))
 
-def retrieve_docs(query):
-    """ RAG retriever """
-    results = db.similarity_search(query, k=4)
-    return "\n\n".join([doc.page_content for doc in results])
+collection = chroma_client.get_or_create_collection(name="support_docs")
 
-from openai import OpenAI
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-def generate_answer(user_query, context):
-    """ Generate RAG answer using context """
-    prompt = f"""
-You are a BookMyShow Support AI.
-
-User Query: {user_query}
-
-Relevant Knowledge:
-{context}
-
-If the context contains answer, use it.
-If not, say "Let me connect you to support".
-
-Provide helpful & short reply.
-"""
-
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role":"system","content":prompt}]
+def retrieve_docs(query: str, k: int = 5, alpha: float = 0.2):
+    """
+    Feedback-aware retrieval.
+    1) Fetch top-N by embedding similarity (n_results=10)
+    2) Convert distances -> similarity (1 - distance)
+    3) final_score = similarity + alpha * feedback_score
+    4) return top-k documents (strings)
+    """
+    query_emb = embedder.encode([query]).tolist()
+    results = collection.query(
+        query_embeddings=query_emb,
+        n_results=10,
+        include=["documents", "metadatas", "distances"]
     )
-    return response.choices[0].message.content.strip()
 
-def ai_support_agent(user_input):
-    """ Classifier + RAG pipeline connection """
+    docs = results.get("documents", [[]])[0]
+    metas = results.get("metadatas", [[]])[0]
+    dists = results.get("distances", [[]])[0]
 
-    # Step 1 — Classify ticket intent
-    category = classify_ticket(user_input)
-    print(f"\n Detected Category: {category}")
+    re_ranked = []
+    for doc, meta, dist in zip(docs, metas, dists):
+        # convert distance to similarity safely
+        try:
+            similarity = 1.0 - float(dist)
+        except Exception:
+            similarity = 0.0
+        feedback_score = meta.get("feedback_score", 0) if isinstance(meta, dict) else 0
+        final_score = similarity + alpha * feedback_score
+        re_ranked.append({
+            "doc": doc,
+            "meta": meta,
+            "similarity": similarity,
+            "feedback_score": feedback_score,
+            "final_score": final_score
+        })
 
-    # Step 2 — Decide if RAG should answer
-    rag_categories = [
-        "Payment Issue", 
-        "Refund Request", 
-        "Ticket Booking Issue"
+    # sort by final_score desc and select top-k
+    re_ranked = sorted(re_ranked, key=lambda x: x["final_score"], reverse=True)
+    # debug printing (useful during development)
+    print("\n--- Retrieval re-ranking debug (top results) ---")
+    for i, item in enumerate(re_ranked[:k]):
+        src = item["meta"].get("source") if isinstance(item["meta"], dict) else "unknown"
+        print(f"{i+1}) final={item['final_score']:.4f} sim={item['similarity']:.4f} fb={item['feedback_score']} src={src}")
+
+    top_docs = [item["doc"] for item in re_ranked[:k]]
+    return top_docs
+
+def generate_answer_with_context(user_query: str, context_docs: list):
+    """
+    Use Groq to generate an answer using retrieved context. If Groq RAG model fails,
+    fallback to smaller instant model.
+    """
+    context_text = "\n\n---\n\n".join(context_docs) if context_docs else ""
+    system_content = (
+        "You are a concise and helpful BookMyShow customer support assistant. "
+        "Use the provided context ONLY to answer. If the context doesn't contain an answer, reply exactly: 'Let me connect you to support.' "
+        "Keep the answer short and actionable (max 200 words). If you mention a policy or step, cite the source file name if available."
+    )
+
+    user_prompt = f"User Query: {user_query}\n\nRelevant Knowledge:\n{context_text}\n\nAnswer:"
+
+    messages = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_prompt}
     ]
 
-    if category in rag_categories:
-        # Retrieve relevant KB docs
-        context = retrieve_docs(user_input)
+    # Try primary RAG model first, fallback to smaller instant model on failure
+    try:
+        answer = groq_chat_completion(messages, model=GROQ_RAG_MODEL, max_tokens=512, temperature=0.1)
+        return answer
+    except Exception as e:
+        print(f"[WARN] Primary RAG model failed: {e}. Trying fallback...")
+        try:
+            answer = groq_chat_completion(messages, model=GROQ_FALLBACK_MODEL, max_tokens=400, temperature=0.1)
+            return answer + "\n\n(Note: Answer generated using fallback model.)"
+        except Exception as e2:
+            print(f"[ERROR] Fallback model also failed: {e2}")
+            return "Let me connect you to support."
 
-        # Generate RAG response
-        answer = generate_answer(user_input, context)
-        return f"{answer}"
-    
-    else:  
-        return f"This looks like a '{category}' — forwarding to human support."
+def ai_support_agent(user_input: str) -> str:
+    """
+    Full RAG pipeline: retrieve context and generate grounded answer.
+    """
+    docs = retrieve_docs(user_input, k=5, alpha=0.2)
+    answer = generate_answer_with_context(user_input, docs)
+    return answer
 
-# CLI chat loop
+# CLI quick test
 if __name__ == "__main__":
-    print("\nBookMyShow AI Support Assistant")
-    print("Type 'exit' to quit.\n")
-
+    print("RAG Agent (feedback-aware)")
     while True:
-        user_input = input("You: ")
-
-        if user_input.lower() == "exit":
-            print("Thank you! Goodbye.")
+        q = input("\nAsk (type 'exit'): ").strip()
+        if q.lower() == "exit":
             break
-
-        reply = ai_support_agent(user_input)
-        print(reply)
+        print("\nResponse:\n", ai_support_agent(q))

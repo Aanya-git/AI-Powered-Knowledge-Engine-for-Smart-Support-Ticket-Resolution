@@ -1,17 +1,7 @@
-langchain-community
-langchain
-
-# PDF Processing (Handles text, images/OCR, and tables)
-unstructured
-
-# Vector Database
-chromadb
-
-# Embedding Model (Use a recommended open-source alternative for now)
+streamlit
 sentence-transformers
-
-# Utility for managing secrets
+chromadb
+groq
 python-dotenv
-
-# Optional (Good for local testing)
-ipykernel
+unstructured    
+requests
