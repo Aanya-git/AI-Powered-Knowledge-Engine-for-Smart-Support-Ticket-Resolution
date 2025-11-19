@@ -1,162 +1,188 @@
-# ingest.py
 """
-Ingest documents from the DATA_PATH into a Chroma vector DB.
-- Deletes existing CHROMA_PATH (safe rebuild)
-- Adds feedback_score: 0 metadata to each chunk
-- Uses SentenceTransformer (EMBED_MODEL) to embed chunks
-- Stores documents + metadata in Chroma collection "support_docs"
+ingest.py — Semantic Chunking + ChromaDB Indexing
+
+This script:
+1. Loads files from DATA_PATH
+2. Extracts text (PDF/DOCX via unstructured, others via plain read)
+3. Splits text using SEMANTIC CHUNKING (sentence embeddings)
+4. Embeds chunks using SentenceTransformer
+5. Stores them in Chroma with metadata + feedback_score = 0
 """
 
 import os
-import shutil
 import glob
+import shutil
+import numpy as np
 from dotenv import load_dotenv
-from config import CHROMA_PATH, DATA_PATH, EMBED_MODEL
 from sentence_transformers import SentenceTransformer
 import chromadb
 from chromadb.config import Settings
 
-# ---------- Parameters ----------
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 1000))        # characters per chunk
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 200))   # overlap between chunks
-COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "support_docs")
-
-# ---------- Load environment ----------
+# -----------------------------
+# Load environment variables
+# -----------------------------
 load_dotenv()
 
-# ---------- Utility functions ----------
-def read_text_file(path):
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        return f.read()
+DATA_PATH = os.getenv("DATA_PATH", "data")
+CHROMA_PATH = os.getenv("CHROMA_PATH", "chroma_db")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "support_docs")
 
-def safe_load_document(path):
+MAX_CHUNK_TOKENS = int(os.getenv("MAX_CHUNK_TOKENS", 350))
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", 0.65))
+
+# -----------------------------
+# NLTK Sentence Tokenizer
+# -----------------------------
+import nltk
+from nltk.tokenize import sent_tokenize
+nltk.download("punkt", quiet=True)
+
+
+# -----------------------------
+# File Reading Utilities
+# -----------------------------
+def read_text_file(file_path):
+    """Fallback raw text loader."""
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except:
+        return ""
+
+
+def extract_text(file_path):
     """
-    Try to load using unstructured if available for PDFs/DOCX,
-    otherwise fallback to raw text read.
+    Extracts text using unstructured for PDFs / DOCX.
+    Falls back to plain text reader otherwise.
     """
     try:
         from unstructured.partition.auto import partition
-        elems = partition(filename=path)
-        text = "\n\n".join([str(el).strip() for el in elems if str(el).strip()])
+        elements = partition(filename=file_path)
+        text = "\n".join([str(e).strip() for e in elements if str(e).strip()])
         if text:
             return text
-    except Exception:
-        try:
-            return read_text_file(path)
-        except Exception:
-            return ""
+    except:
+        pass
 
-def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    return read_text_file(file_path)
+
+
+# -----------------------------
+# Semantic Chunking
+# -----------------------------
+def semantic_chunk_text(text, embedder):
     """
-    Simple character-based chunker with overlap.
-    Returns list of text chunks.
+    Semantic chunking using:
+    - Sentence tokenization
+    - Embedding similarity
+    - Token-length limits
     """
-    if not text:
+    if not text or len(text.strip()) == 0:
         return []
-    text = text.replace("\r\n", "\n")
-    length = len(text)
+
+    sentences = sent_tokenize(text)
+
+    if len(sentences) == 0:
+        return []
+
+    sentence_embeddings = embedder.encode(sentences)
+
     chunks = []
-    start = 0
-    while start < length:
-        end = start + chunk_size
-        chunk = text[start:end]
-        chunks.append(chunk.strip())
-        start = end - overlap
-        if start < 0:
-            start = 0
-    # remove empty chunks and duplicates
-    cleaned = []
-    seen = set()
-    for c in chunks:
-        if not c:
-            continue
-        key = c[:80]
-        if key in seen:
-            continue
-        seen.add(key)
-        cleaned.append(c)
-    return cleaned
+    current_chunk = [sentences[0]]
+    current_tokens = len(sentences[0].split())
+    last_embedding = sentence_embeddings[0]
 
-# ---------- Main ingestion ----------
+    for i in range(1, len(sentences)):
+        sentence = sentences[i]
+        emb = sentence_embeddings[i]
+        similarity = np.dot(emb, last_embedding) / (np.linalg.norm(emb) * np.linalg.norm(last_embedding))
+
+        # Start a new chunk if:
+        # - semantic similarity is low
+        # - chunk would get too long
+        if similarity < SIMILARITY_THRESHOLD or current_tokens + len(sentence.split()) > MAX_CHUNK_TOKENS:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = [sentence]
+            current_tokens = len(sentence.split())
+        else:
+            current_chunk.append(sentence)
+            current_tokens += len(sentence.split())
+
+        last_embedding = emb
+
+    chunks.append(" ".join(current_chunk))
+    return chunks
+
+
+# -----------------------------
+# Main ingestion pipeline
+# -----------------------------
 def build_embeddings_and_index():
-    print("Starting ingestion...")
+    print("\n Starting Semantic Ingestion...")
 
-    # ensure data folder exists
+    # Ensure data folder exists
     if not os.path.exists(DATA_PATH):
         os.makedirs(DATA_PATH)
-        print(f"Created DATA_PATH at '{DATA_PATH}'. Place files to ingest and run again.")
+        print(f" Created DATA_PATH at '{DATA_PATH}'. Add your files and run again.")
         return
 
-    # remove old chroma DB if exists
+    # Cleanup existing Chroma DB
     if os.path.exists(CHROMA_PATH):
-        print(f"Deleting existing Chroma DB at '{CHROMA_PATH}' ...")
+        print(f" Removing old Chroma database at '{CHROMA_PATH}'...")
         shutil.rmtree(CHROMA_PATH)
 
-    # initialize embedder
-    print(f"Loading embedder model: {EMBED_MODEL} ...")
+    # Load embedder
+    print(f"\n Loading embedding model: {EMBED_MODEL}")
     embedder = SentenceTransformer(EMBED_MODEL)
 
-    # gather files
-    patterns = ["*.*"]  # all files in data
-    files = []
-    for p in patterns:
-        files.extend(glob.glob(os.path.join(DATA_PATH, p)))
+    # Get list of files
+    files = glob.glob(os.path.join(DATA_PATH, "*"))
     files = [f for f in files if os.path.isfile(f) and not os.path.basename(f).startswith(".")]
 
     if not files:
-        print(f"No files found in '{DATA_PATH}'. Place text/PDF/docx files and run again.")
+        print(f" No files found in '{DATA_PATH}'. Add files and try again.")
         return
 
     docs = []
     metadatas = []
     ids = []
 
-    for filepath in files:
-        filename = os.path.basename(filepath)
-        print(f"\nLoading: {filename}")
-        text = safe_load_document(filepath)
+    # Process each file
+    for file_path in files:
+        filename = os.path.basename(file_path)
+        print(f"\n Processing: {filename}")
+
+        text = extract_text(file_path)
         if not text:
-            print(f" - Skipped (no text extracted): {filename}")
+            print(f" No text extracted. Skipping {filename}")
             continue
 
-        chunks = chunk_text(text)
-        print(f" - Extracted {len(chunks)} chunks from {filename}")
+        chunks = semantic_chunk_text(text, embedder)
+        print(f" Created {len(chunks)} semantic chunks")
 
-        for i, c in enumerate(chunks):
-            doc_id = f"{filename}--{i}"
-            docs.append(c)
+        for i, chunk in enumerate(chunks):
+            docs.append(chunk)
             metadatas.append({
                 "source": filename,
                 "chunk_index": i,
-                # default feedback score for new chunks
                 "feedback_score": 0
             })
-            ids.append(doc_id)
+            ids.append(f"{filename}--{i}")
 
     if not docs:
-        print("No chunks to index.")
+        print(" No documents to index.")
         return
 
-    # encode all embeddings in batches
-    print("\nEncoding embeddings...")
-    embeddings = embedder.encode(docs, show_progress_bar=True, batch_size=32)
+    print("\n Encoding embeddings for all chunks...")
+    embeddings = embedder.encode(docs, batch_size=32, show_progress_bar=True)
 
-    # ensure chroma client persists to CHROMA_PATH
-    try:
-        client = chromadb.PersistentClient(path=CHROMA_PATH)
-    except Exception:
-        client = chromadb.Client(Settings(persist_directory=CHROMA_PATH))
+    # Initialize Chroma
+    print(f"\n Creating ChromaDB at: {CHROMA_PATH}")
+    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    collection = client.get_or_create_collection(name=COLLECTION_NAME)
 
-    # create or get collection
-    try:
-        collection = client.get_or_create_collection(name=COLLECTION_NAME)
-    except Exception:
-        try:
-            collection = client.create_collection(name=COLLECTION_NAME)
-        except Exception as e:
-            raise RuntimeError(f"Unable to create/get Chroma collection: {e}")
-
-    print(f"\nUpserting {len(docs)} documents into Chroma collection '{COLLECTION_NAME}' ...")
+    print(f"\n Upserting {len(docs)} chunks into Chroma collection '{COLLECTION_NAME}'...")
     collection.add(
         ids=ids,
         documents=docs,
@@ -164,14 +190,13 @@ def build_embeddings_and_index():
         embeddings=embeddings
     )
 
-    # persist
-    try:
-        client.persist()
-    except Exception:
-        pass
+    print("\n Ingestion complete!")
+    print(f" Chunks stored: {len(docs)}")
+    print(f" Chroma path: {CHROMA_PATH}")
 
-    print("\nIngestion complete. Chroma DB at:", CHROMA_PATH)
-    print(f"Total documents indexed: {len(docs)}")
 
+# -----------------------------
+# Run script
+# -----------------------------
 if __name__ == "__main__":
     build_embeddings_and_index()
