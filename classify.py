@@ -13,6 +13,22 @@ INTENT_CATEGORIES: List[str] = [
     "General Query / Other"
 ]
 
+def normalize_category(cat: str) -> str:
+    """
+    Normalize small variations the model may output.
+    """
+    if not cat:
+        return "General Query / Other"
+
+    cat = cat.strip().replace('"', '')
+
+    # Convert plural to singular
+    if cat.lower() in ["general query / others", "general query/others"]:
+        return "General Query / Other"
+
+    return cat
+
+
 def classify_ticket(text: str) -> str:
     """
     Classify the ticket text into one category from INTENT_CATEGORIES.
@@ -34,13 +50,21 @@ def classify_ticket(text: str) -> str:
     ]
 
     try:
-        resp = groq_chat_completion(messages, model="llama-3.3-8b-instant", max_tokens=32, temperature=0.0)
-        category = resp.strip().strip('"').strip()
+        resp = groq_chat_completion(
+            messages,
+            model=GROQ_CLASSIFY_MODEL,   # FIXED: using config model
+            max_tokens=32,
+            temperature=0.0
+        )
+
+        category = normalize_category(resp)
+
         if category not in INTENT_CATEGORIES:
             return "General Query / Other"
+
         return category
-    except Exception as e:
-        # On error, fallback to a safe default (so pipeline doesn't crash)
+
+    except Exception:
         return "General Query / Other"
 
 
