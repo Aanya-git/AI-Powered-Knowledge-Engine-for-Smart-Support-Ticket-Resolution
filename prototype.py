@@ -25,7 +25,7 @@ SHOW_DEBUG = os.getenv("SHOW_DEBUG", "false").lower() in ("1", "true", "yes")
 pathlib.Path(KB_DIR).mkdir(parents=True, exist_ok=True)
 pathlib.Path("attachments").mkdir(parents=True, exist_ok=True)
 
-st.set_page_config(page_title="BookMyShow — Smart Ticket Resolver (Prototype)", layout="wide")
+st.set_page_config(page_title="BookMyShow — Smart Ticket Resolver ", layout="wide")
 
 # -------------------------
 # Try to import backend RAG functions (best-effort)
@@ -232,18 +232,7 @@ def notify_user_placeholder(ticket_id, message):
 def login_page():
     st.title("BookMyShow — Smart Support")
     st.write("Login as a User  or Admin .")
-    st.markdown("**Demo credentials:** User:`user/user123`  •  Admin:`admin/admin123`")
-    # Demo quick-login buttons
-    col1, col2 = st.columns(2)
-    if col1.button("Demo login as User"):
-        # set session and rerun
-        st.session_state.auth = {"logged_in": True, "role": "user", "user": APP_USER}
-        st.experimental_rerun()
-    if col2.button("Demo login as Admin"):
-        st.session_state.auth = {"logged_in": True, "role": "admin", "user": ADMIN_USER}
-        st.experimental_rerun()
 
-    st.markdown("---")
     with st.form("login_form"):
         col1, col2 = st.columns([1, 1])
         with col1:
@@ -378,7 +367,7 @@ def admin_dashboard():
                 claim_key = f"claim_{t['id']}"
                 if st.button("Claim & Reply", key=claim_key):
                     st.session_state[f"claiming_{t['id']}"] = True
-                    st.experimental_rerun()
+                    st.rerun()
                 if st.session_state.get(f"claiming_{t['id']}", False):
                     st.markdown("**Reply & Resolve**")
                     reply = st.text_area("Your response to the user", key=f"reply_{t['id']}")
@@ -393,7 +382,7 @@ def admin_dashboard():
                             update_ticket(t["id"], saved_to_kb=1)
                             st.success(f"Saved Q&A to KB at `{kb_path}`")
                         st.session_state.pop(f"claiming_{t['id']}", None)
-                        st.experimental_rerun()
+                        st.rerun()
 
     st.markdown("---")
     st.subheader("All tickets (for audit)")
