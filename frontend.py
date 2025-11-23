@@ -1,4 +1,4 @@
-# streamlit_frontend.py
+# streamlit_frontend_singlefile.py
 import os
 import sqlite3
 import uuid
@@ -14,15 +14,17 @@ import streamlit as st
 load_dotenv()
 APP_USER = os.getenv("APP_USER", "user")
 APP_PASS = os.getenv("APP_PASS", "user123")
-ADMIN_USER = os.getenv("ADMIN_USER", "admin")
-ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
+# Use support constants (replace earlier admin)
+SUPPORT_USER = os.getenv("SUPPORT_USER", os.getenv("ADMIN_USER", "support"))
+SUPPORT_PASS = os.getenv("SUPPORT_PASS", os.getenv("ADMIN_PASS", "support123"))
 KB_DIR = os.getenv("KB_DIR", "kb_docs")
 DB_PATH = os.getenv("TICKETS_DB", "tickets.db")
+SHOW_DEBUG = os.getenv("SHOW_DEBUG", "false").lower() in ("1", "true", "yes")
 
 pathlib.Path(KB_DIR).mkdir(parents=True, exist_ok=True)
 pathlib.Path("attachments").mkdir(parents=True, exist_ok=True)
 
-st.set_page_config(page_title="BookMyShow — Smart Ticket Resolver (Prototype)", layout="wide")
+st.set_page_config(page_title="Smart Support — Chat + Tickets", layout="wide")
 
 # -------------------------
 # Try to import backend RAG functions (best-effort)
@@ -33,8 +35,7 @@ retrieve_docs = None
 generate_answer = None
 connected_backend = None
 
-POSSIBLE_BACKEND_MODULES = ["rag_app", "rag", "groq_rag", "rag_service", "ai_rag"]
-
+POSSIBLE_BACKEND_MODULES = ["rag_app", "rag", "groq_rag", "rag_service", "ai_rag", "ingest", "query", "llm_utils"]
 for mod_name in POSSIBLE_BACKEND_MODULES:
     try:
         module = __import__(mod_name)
@@ -52,7 +53,7 @@ for mod_name in POSSIBLE_BACKEND_MODULES:
         pass
 
 # -------------------------
-# Database helpers
+# Database helpers (tickets + attachments preserved)
 # -------------------------
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -62,6 +63,7 @@ def get_conn():
 
 def init_db(conn):
     c = conn.cursor()
+    # keep your tickets + attachments table (unchanged)
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS tickets (
@@ -91,68 +93,57 @@ def init_db(conn):
         )
         """
     )
+    # ---------- Add messages table for chat (non-destructive)
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS messages (
+            id TEXT PRIMARY KEY,
+            ticket_id TEXT,
+            sender TEXT,
+            content TEXT,
+            created_at TEXT
+        )
+        """
+    )
     conn.commit()
 
 conn = get_conn()
 
 # -------------------------
-# Authentication state and helpers
+# Messages helpers
 # -------------------------
-if "auth" not in st.session_state:
-    st.session_state.auth = {"logged_in": False, "role": None, "user": None}
+def add_message(ticket_id, sender, content):
+    mid = str(uuid.uuid4())
+    created_at = datetime.utcnow().isoformat()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO messages (id, ticket_id, sender, content, created_at) VALUES (?,?,?,?,?)",
+        (mid, ticket_id, sender, content, created_at),
+    )
+    conn.commit()
+    return mid
 
-def login(user_input, pass_input, role):
-    if role == "user":
-        if user_input == APP_USER and pass_input == APP_PASS:
-            st.session_state.auth = {"logged_in": True, "role": "user", "user": user_input}
-            return True
-        return False
-    elif role == "admin":
-        if user_input == ADMIN_USER and pass_input == ADMIN_PASS:
-            st.session_state.auth = {"logged_in": True, "role": "admin", "user": user_input}
-            return True
-        return False
-    return False
-
-def logout():
-    st.session_state.auth = {"logged_in": False, "role": None, "user": None}
-    st.experimental_rerun()
+def get_messages(ticket_id, limit=200):
+    c = conn.cursor()
+    c.execute("SELECT sender, content, created_at FROM messages WHERE ticket_id=? ORDER BY created_at ASC LIMIT ?", (ticket_id, limit))
+    rows = c.fetchall()
+    return [dict(r) for r in rows]
 
 # -------------------------
-# Ticket & attachment helpers
+# Ticket helpers (kept)
 # -------------------------
-def create_ticket(title, description, priority, creator):
+def create_ticket(title, description, creator):
     ticket_id = str(uuid.uuid4())
     created_at = datetime.utcnow().isoformat()
     c = conn.cursor()
     c.execute(
         "INSERT INTO tickets (id,title,description,created_at,status,priority,creator,assigned_to,ai_response,needs_human,resolver_response,feedback,saved_to_kb) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (ticket_id, title, description, created_at, "open", priority, creator, None, None, 1, None, None, 0),
+        (ticket_id, title, description, created_at, "open", None, creator, None, None, 1, None, None, 0),
     )
     conn.commit()
+    # also create an initial system message
+    add_message(ticket_id, "system", f"Ticket created: {title}")
     return ticket_id
-
-def add_attachment(ticket_id, uploaded_file):
-    attach_id = str(uuid.uuid4())
-    filename = uploaded_file.name
-    save_dir = pathlib.Path("attachments")
-    save_dir.mkdir(parents=True, exist_ok=True)
-    filepath = save_dir / f"{attach_id}_{filename}"
-    with open(filepath, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO attachments (id, ticket_id, filename, filepath) VALUES (?,?,?,?)",
-        (attach_id, ticket_id, filename, str(filepath)),
-    )
-    conn.commit()
-    return str(filepath)
-
-def get_ticket(ticket_id):
-    c = conn.cursor()
-    c.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,))
-    row = c.fetchone()
-    return dict(row) if row else None
 
 def list_tickets(filter_by=None):
     c = conn.cursor()
@@ -167,6 +158,12 @@ def list_tickets(filter_by=None):
         c.execute(q)
     rows = c.fetchall()
     return [dict(r) for r in rows]
+
+def get_ticket(ticket_id):
+    c = conn.cursor()
+    c.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,))
+    row = c.fetchone()
+    return dict(row) if row else None
 
 def update_ticket(ticket_id, **kwargs):
     c = conn.cursor()
@@ -184,27 +181,20 @@ def save_qna_to_kb(title, question, answer):
     fname = f"{int(time.time())}_{title.replace(' ', '_')}.txt"
     path = pathlib.Path(KB_DIR) / fname
     path.write_text(f"Q: {question}\n\nA: {answer}\n")
-    # best-effort call into backend indexer
     if add_to_chroma:
         try:
-            # try common signatures
             add_to_chroma(str(path.read_text()), fname)
-        except TypeError:
+        except Exception:
             try:
                 add_to_chroma(path.read_text(), fname)
             except Exception:
                 pass
-        except Exception:
-            pass
     return str(path)
 
 # -------------------------
 # AI helper (pluggable)
 # -------------------------
 def call_ai_agent(user_query):
-    """
-    Returns (answer_text, resolved_bool, needs_human_bool)
-    """
     if ai_support_agent:
         try:
             answer = ai_support_agent(user_query)
@@ -217,185 +207,238 @@ def call_ai_agent(user_query):
         except Exception as e:
             return (f"AI call failed: {e}", False, True)
     else:
-        # No backend -> escalate to human/admin
-        return ("AI backend not available. Forwarded to admin for human resolution.", False, True)
+        return ("AI backend not available. Please configure rag_app or add ai backend.", False, True)
 
 # -------------------------
-# Small placeholder for notifications (extend as needed)
+# Authentication state and helpers (use support role)
 # -------------------------
-def notify_user_placeholder(ticket_id, message):
-    # You can extend this to send email/Slack. For now it is a no-op.
-    st.info(f"(Notification placeholder) Ticket {ticket_id}: {message}")
+if "auth" not in st.session_state:
+    st.session_state.auth = {"logged_in": False, "role": None, "user": None}
+
+def login(user_input, pass_input, role):
+    role = role.lower()
+    if role == "user":
+        if user_input == APP_USER and pass_input == APP_PASS:
+            st.session_state.auth = {"logged_in": True, "role": "user", "user": user_input}
+            return True
+        return False
+    elif role in ("support", "agent", "admin"):
+        # support role fallback
+        if user_input == SUPPORT_USER and pass_input == SUPPORT_PASS:
+            st.session_state.auth = {"logged_in": True, "role": "support", "user": user_input}
+            return True
+        return False
+    return False
+
+def logout():
+    st.session_state.auth = {"logged_in": False, "role": None, "user": None}
+    st.rerun()
 
 # -------------------------
-# Pages: login, user dashboard, admin dashboard
+# UI helpers (whatsapp-like)
+# -------------------------
+def render_messages(messages, me_label="you", agent_label="support"):
+    # simple "chat bubble" rendering using columns
+    for m in messages:
+        sender = m["sender"]
+        content = m["content"]
+        ts = m["created_at"][:19].replace("T", " ")
+        if sender in ("system", "ai", "agent", "support"):
+            # left aligned (agent/system)
+            cols = st.columns([1, 4])
+            with cols[0]:
+                st.markdown(f"**{sender}**")
+            with cols[1]:
+                st.markdown(f"> {content}  \n*{ts}*")
+        else:
+            # right aligned (user)
+            cols = st.columns([4, 1])
+            with cols[0]:
+                st.markdown("")
+            with cols[1]:
+                st.markdown(f"**{sender}**  \n> {content}  \n*{ts}*")
+
+# -------------------------
+# Pages
 # -------------------------
 def login_page():
-    st.title("BookMyShow — Smart Support (Prototype)")
-    st.write("Login as a User (raise tickets) or Admin (resolve tickets). Default demo credentials are shown in the header.")
-    st.markdown("**Demo credentials:** User:`user/user123`  •  Admin:`admin/admin123`")
+    st.title("Smart Support — Login")
+    st.write("Login as a Customer (user) or Support Agent (support).")
     with st.form("login_form"):
-        col1, col2 = st.columns([1, 1])
+        col1, col2 = st.columns([1,1])
         with col1:
             username = st.text_input("Username")
         with col2:
             password = st.text_input("Password", type="password")
-        role = st.radio("Login as", ("user", "admin"))
+        role = st.radio("Login as", ("user", "support"))
         submitted = st.form_submit_button("Login")
         if submitted:
             ok = login(username.strip(), password.strip(), role)
             if ok:
                 st.success("Logged in.")
-                st.experimental_rerun()
+                strerun()
             else:
                 st.error("Invalid credentials for role: " + role)
+    if SHOW_DEBUG:
+        st.sidebar.markdown("Debug")
+        st.sidebar.write("APP_USER / APP_PASS:", APP_USER, APP_PASS)
+        st.sidebar.write("SUPPORT_USER / SUPPORT_PASS:", SUPPORT_USER, SUPPORT_PASS)
+        st.sidebar.write("Connected backend:", connected_backend if connected_backend else "None")
 
 def user_dashboard():
     st.sidebar.markdown("### Actions")
     if st.sidebar.button("Logout"):
         logout()
 
-    # show connected backend status
     if connected_backend:
-        st.sidebar.success(f"Backend connected: {connected_backend}")
+        st.sidebar.success(f"Backend: {connected_backend}")
     else:
-        st.sidebar.info("Backend not connected — AI calls will be unavailable.")
+        st.sidebar.info("Backend not connected — AI calls unavailable.")
 
-    st.header("Raise a ticket")
-    with st.form("raise_ticket_form", clear_on_submit=True):
-        title = st.text_input("Issue title")
-        description = st.text_area("Describe the issue in detail")
-        priority = st.selectbox("Priority", ("Low", "Medium", "High"))
-        attachments = st.file_uploader("Add attachments (optional)", accept_multiple_files=True, type=None)
-        submit = st.form_submit_button("Submit Ticket & Try AI Resolution")
-        if submit:
-            if not title.strip() or not description.strip():
-                st.warning("Please provide a title and description.")
-            else:
-                ticket_id = create_ticket(title.strip(), description.strip(), priority, st.session_state.auth["user"])
-                # save attachments
-                if attachments:
-                    for f in attachments:
-                        add_attachment(ticket_id, f)
-                st.info("Ticket created: " + ticket_id)
+    st.header("Customer Dashboard")
+    tab = st.tabs(["Raise Query", "Chat with Support"])
 
-                # try AI
-                with st.spinner("Calling AI agent to auto-resolve..."):
-                    answer, resolved, needs_human = call_ai_agent(description)
-                    update_ticket(ticket_id, ai_response=answer, needs_human=1 if needs_human else 0, status="resolved" if resolved else "open")
-                    if resolved:
-                        st.success("AI provided an answer (ticket auto-resolved).")
-                        st.markdown("**AI Answer:**")
-                        st.write(answer)
-                        if st.button("Save this Q&A to KB", key=f"savekb_user_{ticket_id}"):
-                            kb_path = save_qna_to_kb(title, description, answer)
-                            update_ticket(ticket_id, saved_to_kb=1)
-                            st.success(f"Saved to KB: {kb_path}")
+    # ---------------- Raise Query tab ----------------
+    with tab[0]:
+        st.subheader("Submit a new query")
+        with st.form("raise_query_form", clear_on_submit=True):
+            title = st.text_input("Issue title")
+            description = st.text_area("Describe the issue")
+            attachments = st.file_uploader("Add attachments (optional)", accept_multiple_files=True)
+            submit = st.form_submit_button("Submit query")
+            if submit:
+                if not title.strip() or not description.strip():
+                    st.warning("Please provide a title and description.")
+                else:
+                    ticket_id = create_ticket(title.strip(), description.strip(), st.session_state.auth["user"])
+                    # attachments handling (keeps same semantics)
+                    if attachments:
+                        for f in attachments:
+                            filename = f.name
+                            # save file
+                            save_dir = pathlib.Path("attachments")
+                            save_dir.mkdir(parents=True, exist_ok=True)
+                            filepath = save_dir / f"{str(uuid.uuid4())}_{filename}"
+                            with open(filepath, "wb") as fh:
+                                fh.write(f.getbuffer())
+                            c = conn.cursor()
+                            c.execute("INSERT INTO attachments (id, ticket_id, filename, filepath) VALUES (?,?,?,?)",
+                                      (str(uuid.uuid4()), ticket_id, filename, str(filepath)))
+                            conn.commit()
+                    st.success(f"Query created: {ticket_id}")
+
+    # ---------------- Chat tab ----------------
+    with tab[1]:
+        st.subheader("Chat with Support")
+        # show list of user's tickets
+        c = conn.cursor()
+        c.execute("SELECT id, title, status, created_at FROM tickets WHERE creator=? ORDER BY created_at DESC", (st.session_state.auth["user"],))
+        tickets = c.fetchall()
+        ticket_options = [{"id": r["id"], "label": f"{r['title']} — [{r['status']}] — {r['created_at']}"} for r in tickets]
+        if ticket_options:
+            opt_map = {t["label"]: t["id"] for t in ticket_options}
+            sel_label = st.selectbox("Select ticket", [t["label"] for t in ticket_options])
+            selected_ticket_id = opt_map[sel_label]
+            st.markdown("----")
+            st.markdown("**Chat history**")
+            msgs = get_messages(selected_ticket_id)
+            render_messages(msgs, me_label=st.session_state.auth["user"], agent_label="support")
+            st.markdown("----")
+            # send message form
+            with st.form("send_message_form", clear_on_submit=True):
+                msg = st.text_area("Write message to support", key=f"user_msg_{selected_ticket_id}")
+                send = st.form_submit_button("Send to Support")
+                if send:
+                    if not msg.strip():
+                        st.warning("Please enter a message.")
                     else:
-                        st.warning("AI couldn't confidently solve — ticket forwarded to admin.")
-                        st.write(answer)
+                        add_message(selected_ticket_id, st.session_state.auth["user"], msg.strip())
+                        st.success("Message sent to support.")
+                        # Also mark ticket as needs human (if AI previously tried)
+                        update_ticket(selected_ticket_id, needs_human=1, status="open")
+                        st.rerun()
+        else:
+            st.info("You have no queries yet. Create a query in the 'Raise Query' tab.")
 
-    st.markdown("---")
-    st.subheader("Your Tickets")
-    c = conn.cursor()
-    c.execute("SELECT id,title,status,created_at,ai_response,needs_human,feedback FROM tickets WHERE creator=? ORDER BY created_at DESC", (st.session_state.auth["user"],))
-    rows = c.fetchall()
-    if not rows:
-        st.info("You have not raised any tickets yet.")
-    else:
-        for r in rows:
-            t_id = r["id"]
-            t_title = r["title"]
-            t_status = r["status"]
-            t_created = r["created_at"]
-            t_ai_response = r["ai_response"]
-            needs_human = r["needs_human"]
-            with st.expander(f"{t_title} — [{t_status}] — {t_created}"):
-                st.write("Ticket ID:", t_id)
-                st.write("Status:", t_status)
-                if t_ai_response:
-                    st.markdown("**AI Response:**")
-                    st.write(t_ai_response)
-                if t_status == "resolved":
-                    fb = r["feedback"]
-                    if fb is None:
-                        st.write("Was this answer helpful?")
-                        col1, col2 = st.columns(2)
-                        if col1.button("👍 Helpful", key=f"helpful_{t_id}"):
-                            update_ticket(t_id, feedback=1)
-                            st.success("Thanks for your feedback!")
-                        if col2.button("👎 Not helpful", key=f"nothelpful_{t_id}"):
-                            update_ticket(t_id, feedback=0)
-                            st.info("Thanks — this will help improve future answers.")
-                # attachments
-                c.execute("SELECT filename, filepath FROM attachments WHERE ticket_id=?", (t_id,))
-                attachments = c.fetchall()
-                if attachments:
-                    st.markdown("Attachments:")
-                    for a in attachments:
-                        st.write(f"- {a['filename']} (saved at `{a['filepath']}`)")
-
-def admin_dashboard():
+def support_dashboard():
     st.sidebar.markdown("### Actions")
     if st.sidebar.button("Logout"):
         logout()
 
-    st.title("Admin Console — Ticket Resolver")
-    st.markdown("Open tickets (AI couldn't resolve or pending human).")
+    st.title("Support Agent Console")
+    st.markdown("Top: select ticket on the right to load chat and use AI suggestions to assist.")
 
-    tickets = list_tickets(filter_by="open")
-    if not tickets:
-        st.info("No open tickets awaiting admin resolution.")
-    else:
-        for t in tickets:
-            with st.expander(f"{t['title']} — priority: {t['priority']} — created: {t['created_at']}"):
-                st.write("Ticket ID:", t["id"])
-                st.write("Creator:", t["creator"])
-                st.write("Description:")
-                st.write(t["description"])
-                if t["ai_response"]:
-                    st.markdown("**AI tried:**")
-                    st.write(t["ai_response"])
-                # attachments
-                c = conn.cursor()
-                c.execute("SELECT filename, filepath FROM attachments WHERE ticket_id=?", (t["id"],))
-                attachments = c.fetchall()
-                if attachments:
-                    st.markdown("Attachments:")
-                    for a in attachments:
-                        st.write(f"- {a['filename']} (saved: {a['filepath']})")
-                # actions
-                claim_key = f"claim_{t['id']}"
-                if st.button("Claim & Reply", key=claim_key):
-                    st.session_state[f"claiming_{t['id']}"] = True
-                    st.experimental_rerun()
-                if st.session_state.get(f"claiming_{t['id']}", False):
-                    st.markdown("**Reply & Resolve**")
-                    reply = st.text_area("Your response to the user", key=f"reply_{t['id']}")
-                    save_to_kb = st.checkbox("Save this Q&A to KB (so AI learns from this answer)", key=f"savekb_{t['id']}")
-                    submitted = st.button("Send reply & mark resolved", key=f"submit_resolve_{t['id']}")
-                    if submitted:
-                        update_ticket(t["id"], resolver_response=reply, assigned_to=st.session_state.auth["user"], status="resolved", needs_human=0)
-                        st.success("Ticket marked as resolved and user notified.")
-                        notify_user_placeholder(t["id"], "Your ticket has been resolved by the admin.")
-                        if save_to_kb:
-                            kb_path = save_qna_to_kb(t["title"], t["description"], reply)
-                            update_ticket(t["id"], saved_to_kb=1)
-                            st.success(f"Saved Q&A to KB at `{kb_path}`")
-                        st.session_state.pop(f"claiming_{t['id']}", None)
-                        st.experimental_rerun()
+    # left column: ticket list
+    col_left, col_right = st.columns([2,5])
+    with col_left:
+        st.subheader("Open Tickets")
+        tickets = list_tickets(filter_by="open")
+        if not tickets:
+            st.info("No open tickets.")
+            selected_ticket_id = None
+        else:
+            ticket_map = {f"{t['title']} — {t['created_at']} ({t['id'][:6]})": t["id"] for t in tickets}
+            sel_key = st.selectbox("Select ticket to work on", list(ticket_map.keys()))
+            selected_ticket_id = ticket_map[sel_key]
 
-    st.markdown("---")
-    st.subheader("All tickets (for audit)")
-    all_tickets = list_tickets(filter_by="unresolved")
-    if not all_tickets:
-        st.write("No tickets found.")
-    else:
-        for t in all_tickets:
-            st.write(f"{t['created_at']} — {t['id']} — {t['title']} — status: {t['status']} — needs_human: {t['needs_human']}")
+            # quick actions
+            if st.button("Get AI Suggestion for selected ticket"):
+                # use latest user message or ticket description
+                msgs = get_messages(selected_ticket_id)
+                last_user_msgs = [m for m in msgs if m["sender"] == st.session_state.auth["user"] or m["sender"] == "user"]
+                prompt_text = None
+                if last_user_msgs:
+                    prompt_text = last_user_msgs[-1]["content"]
+                else:
+                    tkt = get_ticket(selected_ticket_id)
+                    prompt_text = tkt["description"] if tkt else ""
+
+                with st.spinner("Calling AI (if configured)..."):
+                    answer, resolved, needs_human = call_ai_agent(prompt_text or "")
+                    # insert AI reply as message from 'ai' or 'agent' but mark as suggestion
+                    add_message(selected_ticket_id, "ai", answer)
+                    st.success("AI suggestion saved to messages.")
+                    st.rerun()
+
+    with col_right:
+        st.subheader("Conversation / Reply")
+        if not selected_ticket_id:
+            st.info("Select a ticket from the left to view messages.")
+            return
+        ticket = get_ticket(selected_ticket_id)
+        if not ticket:
+            st.error("Ticket not found.")
+            return
+
+        st.markdown(f"**Ticket:** {ticket['title']}  —  `{ticket['id']}`")
+        st.write("Description:")
+        st.write(ticket["description"])
+        st.markdown("---")
+        messages = get_messages(selected_ticket_id)
+        render_messages(messages, me_label=st.session_state.auth["user"], agent_label="support")
+
+        st.markdown("**Reply to user**")
+        reply = st.text_area("Write reply to user (agent)", key=f"agent_reply_{selected_ticket_id}")
+        save_to_kb = st.checkbox("Save this Q&A to KB", key=f"savekb_{selected_ticket_id}")
+        if st.button("Send reply & mark resolved"):
+            if not reply.strip():
+                st.warning("Reply text required.")
+            else:
+                add_message(selected_ticket_id, "support", reply.strip())
+                update_ticket(selected_ticket_id, resolver_response=reply.strip(), assigned_to=st.session_state.auth["user"], status="resolved", needs_human=0)
+                st.success("Reply sent and ticket marked resolved.")
+                notify_user_placeholder(selected_ticket_id, "Your ticket has been resolved by support.")
+                if save_to_kb:
+                    save_qna_to_kb(ticket["title"], ticket["description"], reply.strip())
+                st.rerun()
+
+# small placeholder for notification (local only)
+def notify_user_placeholder(ticket_id, message):
+    # non-invasive: store a system message so user sees it in chat
+    add_message(ticket_id, "system", message)
 
 # -------------------------
-# App entrypoint
+# Entrypoint
 # -------------------------
 if not st.session_state.auth["logged_in"]:
     login_page()
@@ -404,7 +447,7 @@ else:
     st.sidebar.markdown(f"Logged in as **{st.session_state.auth['user']}** — role: **{role}**")
     if role == "user":
         user_dashboard()
-    elif role == "admin":
-        admin_dashboard()
+    elif role == "support":
+        support_dashboard()
     else:
         st.error("Unknown role. Please logout and login again.")
