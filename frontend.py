@@ -2,7 +2,6 @@ import os
 import sqlite3
 import uuid
 import pathlib
-import time
 from datetime import datetime
 from dotenv import load_dotenv
 import streamlit as st
@@ -21,7 +20,7 @@ DB_PATH = os.getenv("TICKETS_DB", "tickets.db")
 pathlib.Path(KB_DIR).mkdir(parents=True, exist_ok=True)
 pathlib.Path("attachments").mkdir(parents=True, exist_ok=True)
 
-st.set_page_config(page_title="Smart Support — Frontend (fixed)", layout="wide")
+st.set_page_config(page_title="Smart Support — Frontend (chat UI)", layout="wide")
 
 # -------------------------
 # Try to import optional backend RAG functions (best-effort)
@@ -73,26 +72,25 @@ def get_table_columns(conn, table_name):
 def find_message_column(conn):
     """Find a suitable column name in messages table that holds text content."""
     columns = get_table_columns(conn, "messages")
-    # common choices
+    # common names first
     for candidate in ["content", "message", "body", "text", "msg", "content_text"]:
         if candidate in columns:
             return candidate
-    # fallback: return first text-like column other than id/ticket_id/sender/created_at
+    # fallback – anything that's not these metadata fields
     if columns:
         for c in columns:
             if c.lower() not in ("id", "ticket_id", "sender", "created_at", "createdat"):
                 return c
-        if len(columns) >= 1:
-            return columns[-1]
+        return columns[-1]
     return None
 
-MSG_COL = find_message_column(conn)  # will be None if no messages table
+MSG_COL = find_message_column(conn)
 
 # -------------------------
 # Utility helpers
 # -------------------------
 def safe_rerun():
-    """Rerun if possible without raising attribute errors across streamlit versions."""
+    """Rerun safely across Streamlit versions."""
     if hasattr(st, "experimental_rerun"):
         try:
             st.experimental_rerun()
@@ -105,7 +103,6 @@ def safe_rerun():
             pass
 
 def login_check(user_input, pass_input, role):
-    """Return True if credentials match configured demo creds."""
     if role == "user":
         return user_input == APP_USER and pass_input == APP_PASS
     elif role == "support":
@@ -119,15 +116,18 @@ def create_ticket(title, description, creator):
     # try full schema first
     try:
         c.execute(
-            "INSERT INTO tickets (id,title,description,created_at,status,priority,creator,assigned_to,ai_response,needs_human,resolver_response,feedback,saved_to_kb) "
+            "INSERT INTO tickets (id,title,description,created_at,status,priority,creator,"
+            "assigned_to,ai_response,needs_human,resolver_response,feedback,saved_to_kb) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (ticket_id, title, description, created_at, "open", "Low", creator, None, None, 1, None, None, 0),
+            (ticket_id, title, description, created_at, "open", "Low", creator,
+             None, None, 1, None, None, 0),
         )
     except Exception:
-        # minimal insert if schema is smaller
+        # minimal insert if schema different
         try:
             c.execute(
-                "INSERT INTO tickets (id,title,description,created_at,status,creator) VALUES (?,?,?,?,?,?)",
+                "INSERT INTO tickets (id,title,description,created_at,status,creator) "
+                "VALUES (?,?,?,?,?,?)",
                 (ticket_id, title, description, created_at, "open", creator),
             )
         except Exception as e:
@@ -165,7 +165,8 @@ def add_message_to_db(ticket_id, sender, content):
     inserted = False
     try:
         c.execute(
-            "INSERT INTO messages (id,ticket_id,sender,content,created_at) VALUES (?,?,?,?,?)",
+            "INSERT INTO messages (id,ticket_id,sender,content,created_at) "
+            "VALUES (?,?,?,?,?)",
             (str(uuid.uuid4()), ticket_id, sender, content, now),
         )
         inserted = True
@@ -176,11 +177,11 @@ def add_message_to_db(ticket_id, sender, content):
                 q = f"INSERT INTO messages (ticket_id,sender,{MSG_COL},created_at) VALUES (?,?,?,?)"
                 c.execute(q, (ticket_id, sender, content, now))
                 inserted = True
-            else:
-                if len(cols) >= 1:
-                    q = f"INSERT INTO messages ({cols[0]}) VALUES (?)"
-                    c.execute(q, (content,))
-                    inserted = True
+            elif cols:
+                # last-chance: just dump into first column
+                q = f"INSERT INTO messages ({cols[0]}) VALUES (?)"
+                c.execute(q, (content,))
+                inserted = True
         except Exception as e:
             st.error(f"Failed to save message to DB: {e}")
     if inserted:
@@ -188,7 +189,7 @@ def add_message_to_db(ticket_id, sender, content):
     return inserted
 
 def get_messages_for_ticket(ticket_id):
-    """Return ordered messages for a ticket as list of dicts {sender, content, created_at}."""
+    """Return list of {sender, content, created_at} for a ticket."""
     c = conn.cursor()
     try:
         if MSG_COL:
@@ -199,11 +200,7 @@ def get_messages_for_ticket(ticket_id):
             c.execute(q, (ticket_id,))
             rows = c.fetchall()
             return [
-                {
-                    "sender": r["sender"],
-                    "content": r["content"],
-                    "created_at": r["created_at"],
-                }
+                {"sender": r["sender"], "content": r["content"], "created_at": r["created_at"]}
                 for r in rows
             ]
         else:
@@ -217,12 +214,7 @@ def get_messages_for_ticket(ticket_id):
                 d = dict(r)
                 text_field = None
                 for k, v in d.items():
-                    if isinstance(v, str) and k not in (
-                        "id",
-                        "ticket_id",
-                        "sender",
-                        "created_at",
-                    ):
+                    if isinstance(v, str) and k not in ("id", "ticket_id", "sender", "created_at"):
                         text_field = v
                         break
                 result.append(
@@ -237,10 +229,119 @@ def get_messages_for_ticket(ticket_id):
         return []
 
 # -------------------------
-# AI helper (pluggable)
+# Chat UI helper – WhatsApp-like with spacing
+# -------------------------
+def render_chat_messages(messages, me, customer_name=None):
+    """
+    Render messages in a WhatsApp-like style.
+    - `me`           : current logged-in username
+    - `customer_name`: ticket creator name (for agent view)
+    """
+
+    # Global CSS for bubbles & vertical spacing
+    st.markdown(
+        """
+        <style>
+        .chat-container {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            padding: 0.5rem 0;
+        }
+        .chat-row {
+            display: flex;
+            width: 100%;
+        }
+        .chat-row.me {
+            justify-content: flex-end;
+        }
+        .chat-row.other {
+            justify-content: flex-start;
+        }
+        .chat-bubble {
+            max-width: 70%;
+            padding: 10px 14px;
+            border-radius: 14px;
+            font-size: 0.9rem;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.08);
+        }
+        .chat-bubble.me {
+            background-color: #dcf8c6;  /* WhatsApp green */
+        }
+        .chat-bubble.other {
+            background-color: #ffffff;
+            border: 1px solid #e5e5e5;
+        }
+        .chat-label {
+            font-weight: 600;
+            margin-bottom: 4px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .chat-meta {
+            font-size: 0.7rem;
+            color: #777;
+            margin-top: 4px;
+        }
+        .chat-avatar {
+            width: 20px;
+            height: 20px;
+            border-radius: 999px;
+            background: #ff5b57;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 0.7rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="chat-container">', unsafe_allow_html=True)
+
+    for m in messages:
+        sender = m.get("sender", "")
+        content = m.get("content", "")
+        created_at = m.get("created_at", "")
+
+        is_me = sender == me
+
+        if sender == me:
+            label = "You"
+        elif customer_name and sender == customer_name:
+            label = "Customer"
+        else:
+            label = sender or "Support"
+
+        row_class = "me" if is_me else "other"
+        bubble_class = "me" if is_me else "other"
+
+        st.markdown(
+            f"""
+            <div class="chat-row {row_class}">
+              <div class="chat-bubble {bubble_class}">
+                <div class="chat-label">
+                    <div class="chat-avatar">👤</div>
+                    <span>{label}</span>
+                </div>
+                <div>{content}</div>
+                <div class="chat-meta">{created_at}</div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# -------------------------
+# AI helper
 # -------------------------
 def call_ai_agent_for_ticket(context_text):
-    """Return (answer_text, resolved_bool, needs_human_bool)."""
+    """Call optional backend AI (rag_app) if available."""
     if ai_support_agent:
         try:
             ans = ai_support_agent(context_text)
@@ -270,7 +371,7 @@ def do_logout():
 # -------------------------
 def login_page():
     st.title("Smart Support — Login")
-    st.write("Login as Customer or Support Agent.")
+    st.write("Login as **Customer** or **Support Agent**.")
     with st.form("login_form"):
         u = st.text_input("Username")
         p = st.text_input("Password", type="password")
@@ -289,7 +390,7 @@ def login_page():
                 st.error(f"Invalid credentials for role: {role}")
 
 # -------------------------
-# UI: user dashboard (customer)
+# UI: user dashboard
 # -------------------------
 def user_dashboard():
     st.sidebar.markdown("### Actions")
@@ -301,19 +402,21 @@ def user_dashboard():
     else:
         st.sidebar.info("Backend not connected — AI features unavailable")
 
-    st.header("Customer Portal — Raise query / Chat with Support")
+    st.header("Customer Portal")
+
     tab_raise, tab_chat = st.tabs(["Raise query", "Chat with Support"])
 
-    # ---- Raise query tab ----
+    # --- Raise query tab ---
     with tab_raise:
-        st.subheader("Raise a new query")
+        st.subheader("Create a new query")
+        st.caption("Your query will be handled by a support agent. AI only assists the agent.")
         with st.form("raise_query_form", clear_on_submit=True):
             title = st.text_input("Issue title")
             description = st.text_area("Describe the issue in detail")
             attachments = st.file_uploader(
                 "Add attachments (optional)", accept_multiple_files=True
             )
-            submit = st.form_submit_button("Submit query")
+            submit = st.form_submit_button("Submit query (agent will reply)")
             if submit:
                 if not title.strip() or not description.strip():
                     st.warning("Please provide both title and description.")
@@ -324,6 +427,7 @@ def user_dashboard():
                         st.session_state.auth["user"],
                     )
                     if ticket_id:
+                        # save attachments
                         for f in attachments:
                             sid = str(uuid.uuid4())
                             save_dir = pathlib.Path("attachments")
@@ -341,9 +445,9 @@ def user_dashboard():
                             except Exception:
                                 pass
                         st.success(
-                            f"Ticket created: {ticket_id}. It will appear to support agent."
+                            f"Query created: {ticket_id}. A support agent will respond shortly."
                         )
-                        # initial message to messages table
+                        # first message is the description
                         add_message_to_db(
                             ticket_id,
                             st.session_state.auth["user"],
@@ -352,52 +456,46 @@ def user_dashboard():
                     else:
                         st.error("Query creation failed.")
 
-    # ---- Chat tab ----
+    # --- Chat tab ---
     with tab_chat:
-        st.subheader("Your queries & chat")
+        st.subheader("Chat with support")
+
         rows = list_user_tickets(st.session_state.auth["user"])
         if not rows:
             st.info("You have not raised any queries yet.")
-        else:
-            ticket_map = {
-                f"{r['title']} — [{r['status']}] — {r['created_at']}": r["id"]
-                for r in rows
-            }
-            sel = st.selectbox(
-                "Select a query to view chat", options=list(ticket_map.keys())
-            )
-            t_id = ticket_map[sel]
-            st.markdown("### Chat for selected query")
+            return
 
-            messages = get_messages_for_ticket(t_id)
-            for m in messages:
-                who = (
-                    "You"
-                    if m["sender"] == st.session_state.auth["user"]
-                    else m["sender"]
+        ticket_map = {
+            f"{r['title']} — [{r['status']}] — {r['created_at']}": r["id"] for r in rows
+        }
+        sel_label = st.selectbox("Select a query", options=list(ticket_map.keys()))
+        t_id = ticket_map[sel_label]
+
+        st.markdown("---")
+        st.markdown("#### Conversation")
+
+        messages = get_messages_for_ticket(t_id)
+        render_chat_messages(messages, me=st.session_state.auth["user"])
+
+        st.markdown("---")
+        new_msg = st.text_area(
+            "Write your message to support", key=f"usermsg_{t_id}", height=80
+        )
+        if st.button("Send to support", key=f"send_{t_id}"):
+            if new_msg.strip():
+                ok = add_message_to_db(
+                    t_id, st.session_state.auth["user"], new_msg.strip()
                 )
-                st.markdown(f"**{who}** — {m.get('created_at','')}")
-                st.write(m.get("content", ""))
-                st.write("---")
-
-            new_msg = st.text_area(
-                "Write your message to support", key=f"usermsg_{t_id}"
-            )
-            if st.button("Send to support", key=f"send_{t_id}"):
-                if new_msg.strip():
-                    ok = add_message_to_db(
-                        t_id, st.session_state.auth["user"], new_msg.strip()
-                    )
-                    if ok:
-                        st.success("Message sent to support agent.")
-                        safe_rerun()
-                    else:
-                        st.error("Failed to send message.")
+                if ok:
+                    st.success("Message sent to support agent.")
+                    safe_rerun()
                 else:
-                    st.warning("Type a message before sending.")
+                    st.error("Failed to send message.")
+            else:
+                st.warning("Type a message before sending.")
 
 # -------------------------
-# UI: agent dashboard (support)
+# UI: agent dashboard
 # -------------------------
 def agent_dashboard():
     st.sidebar.markdown("### Actions")
@@ -405,24 +503,21 @@ def agent_dashboard():
         do_logout()
 
     st.title("Support Agent")
-    st.markdown("Open queries assigned to support.")
+    st.markdown("Open queries assigned to support. AI suggestions are only visible to you.")
 
     tickets = list_tickets_for_agent()
     if not tickets:
         st.info("No open queries awaiting support.")
         return
 
-    # ----- Better UI: dropdown instead of many narrow columns -----
-    ticket_labels = [
-        f"{t.get('title', '(no title)')} — {t.get('created_at', '')} — {t['id'][:8]}"
+    ticket_labels = {
+        f"{t.get('title','(no title)')} — {t.get('created_at','')}": t["id"]
         for t in tickets
-    ]
-    chosen = st.selectbox("Select an open query", ticket_labels)
-    selected_index = ticket_labels.index(chosen)
-    open_ticket = tickets[selected_index]
-    open_id = open_ticket["id"]
+    }
+    sel_label = st.selectbox("Select an open query", list(ticket_labels.keys()))
+    open_id = ticket_labels[sel_label]
 
-    # load full ticket row directly from DB (keeps compatibility with backend)
+    # Load selected ticket
     c = conn.cursor()
     try:
         c.execute("SELECT * FROM tickets WHERE id=?", (open_id,))
@@ -435,40 +530,38 @@ def agent_dashboard():
         st.error(f"Failed to load ticket: {e}")
         return
 
+    st.markdown("---")
     st.subheader(f"Ticket: {t.get('title')} — {open_id}")
     st.write("Creator:", t.get("creator"))
     st.write("Description:")
     st.write(t.get("description"))
 
-    # show chat messages
-    st.markdown("### Conversation with customer")
+    # Conversation panel
+    st.markdown("#### Chat with customer")
     messages = get_messages_for_ticket(open_id)
-    if not messages:
-        st.info("No messages yet.")
-    else:
-        for m in messages:
-            who = "Customer" if m["sender"] == t.get("creator") else m["sender"]
-            st.markdown(f"**{who}** — {m.get('created_at','')}")
-            st.write(m.get("content", ""))
-            st.write("---")
+    creator = t.get("creator")
+    render_chat_messages(
+        messages, me=st.session_state.auth["user"], customer_name=creator
+    )
 
-    st.markdown("### Agent actions")
+    # Agent tools
+    st.markdown("---")
+    st.markdown("#### Agent tools")
 
-    # Get AI suggestion (uses backend if present)
-    if st.button("Get AI suggestion for this query"):
+    if st.button("Get AI Suggestion for this query"):
         context_text = t.get("description", "") + "\n\nMessages:\n"
         for m in messages:
             context_text += f"{m['sender']}: {m['content']}\n"
         ans, resolved, needs_human = call_ai_agent_for_ticket(context_text)
         st.session_state[f"ai_suggestion_{open_id}"] = ans
         if ans:
-            st.success("AI suggestion generated.")
+            st.success("AI suggestion retrieved.")
         else:
             st.info("AI did not return suggestion.")
 
     ai_s = st.session_state.get(f"ai_suggestion_{open_id}", "")
     if ai_s:
-        st.markdown("**AI Suggestion (preview)**")
+        st.markdown("**AI Suggestion (preview only for agent)**")
         st.write(ai_s)
         if st.button("Use suggestion as reply"):
             added = add_message_to_db(open_id, st.session_state.auth["user"], ai_s)
@@ -476,9 +569,8 @@ def agent_dashboard():
                 st.success("Suggestion added as agent reply.")
                 safe_rerun()
 
-    # manual reply
     reply_text = st.text_area(
-        "Your reply to customer (agent)", key=f"reply_{open_id}"
+        "Your reply to customer (manual)", key=f"reply_{open_id}", height=80
     )
     if st.button("Send reply to customer"):
         if not reply_text.strip():
