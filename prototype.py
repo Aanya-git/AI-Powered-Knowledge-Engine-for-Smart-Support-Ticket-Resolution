@@ -2,10 +2,19 @@ import os
 import sqlite3
 import uuid
 import pathlib
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
 import streamlit as st
+import matplotlib.pyplot as plt  # <-- for pie chart
+
+# =========================
+# Optional auto-refresh helper
+# =========================
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    st_autorefresh = None  # chat will still work, just without auto-refresh
 
 # =========================
 # Config / defaults
@@ -15,6 +24,11 @@ APP_USER = os.getenv("APP_USER", "user")
 APP_PASS = os.getenv("APP_PASS", "user123")
 SUPPORT_USER = os.getenv("SUPPORT_USER", "support")
 SUPPORT_PASS = os.getenv("SUPPORT_PASS", "admin123")
+
+# Admin credentials
+ADMIN_USER = os.getenv("ADMIN_USER", "admin")
+ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
+
 KB_DIR = os.getenv("KB_DIR", "kb_docs")
 DB_PATH = os.getenv("TICKETS_DB", "tickets.db")
 
@@ -22,6 +36,15 @@ pathlib.Path(KB_DIR).mkdir(parents=True, exist_ok=True)
 pathlib.Path("attachments").mkdir(parents=True, exist_ok=True)
 
 st.set_page_config(page_title="Smart Support — Frontend", layout="wide")
+
+# =========================
+# Timezone helper (IST, 24h)
+# =========================
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def now_ist_str():
+    """Return current time in IST as 'YYYY-MM-DD HH:MM' (24h)."""
+    return datetime.now(IST).strftime("%Y-%m-%d %H:%M")
 
 # =========================
 # Optional backend RAG import
@@ -95,15 +118,18 @@ def safe_rerun():
             pass
 
 def login_check(user_input, pass_input, role):
+    # usernames can be anything; we only validate by role password
     if role == "user":
-        return user_input == APP_USER and pass_input == APP_PASS
+        return pass_input == APP_PASS
     elif role == "support":
-        return user_input == SUPPORT_USER and pass_input == SUPPORT_PASS
+        return pass_input == SUPPORT_PASS
+    elif role == "admin":
+        return pass_input == ADMIN_PASS
     return False
 
 def create_ticket(title, description, creator):
     ticket_id = str(uuid.uuid4())
-    created_at = datetime.utcnow().isoformat()
+    created_at = now_ist_str()
     c = conn.cursor()
     try:
         c.execute(
@@ -148,7 +174,7 @@ def create_ticket(title, description, creator):
 def list_tickets_for_agent():
     c = conn.cursor()
     try:
-        c.execute("SELECT * FROM tickets WHERE status='open' OR status='resolved' ORDER BY created_at DESC")
+        c.execute("SELECT * FROM tickets ORDER BY created_at DESC")
         return [dict(r) for r in c.fetchall()]
     except Exception as e:
         st.error(f"Listing tickets failed: {e}")
@@ -173,7 +199,7 @@ def list_user_tickets(user):
 
 def add_message_to_db(ticket_id, sender, content):
     c = conn.cursor()
-    now = datetime.utcnow().isoformat()
+    now = now_ist_str()
     inserted = False
     try:
         c.execute(
@@ -278,15 +304,11 @@ def render_chat_messages(messages, current_user, creator):
         left_col, right_col = st.columns([6, 6])
 
         if is_me:
-            # current logged-in user on the right
             with right_col:
-                st.markdown(
-                    f"**You**",
-                )
+                st.markdown("**You**")
                 st.success(f"{content}\n\n*{created_at}*")
         else:
-            # other side (customer or support) on the left
-            label = "Customer" if is_customer else sender or "Support"
+            label = "Customer" if is_customer else (sender or "Support")
             with left_col:
                 st.markdown(f"**{label}**")
                 st.info(f"{content}\n\n*{created_at}*")
@@ -324,12 +346,12 @@ def do_logout():
 # =========================
 def login_page():
     st.title("Smart Support — Login")
-    st.write("Login as **Customer** or **Support Agent**.")
+    st.write("Login as **Customer**, **Support Agent**, or **Admin**.")
 
     with st.form("login_form_unique"):
         u = st.text_input("Username")
         p = st.text_input("Password", type="password")
-        role = st.radio("Login as", ("user", "support"))
+        role = st.radio("Login as", ("user", "support", "admin"))
         submitted = st.form_submit_button("Login")
         if submitted:
             if login_check(u.strip(), p.strip(), role):
@@ -347,6 +369,10 @@ def login_page():
 # User dashboard (customer)
 # =========================
 def user_dashboard():
+    # auto-refresh (every 5 seconds) for live chat
+    if st_autorefresh:
+        st_autorefresh(interval=5000, key="user_refresh")
+
     st.sidebar.markdown("### Actions")
     if st.sidebar.button("Logout"):
         do_logout()
@@ -438,7 +464,6 @@ def user_dashboard():
                 ok = add_message_to_db(t_id, st.session_state.auth["user"], new_msg.strip())
                 if ok:
                     st.success("Message sent to support agent.")
-                    # once user sends new message after resolving, ticket can be reopened if you want:
                     set_ticket_status(t_id, status="open", needs_human=1)
                     safe_rerun()
                 else:
@@ -447,7 +472,6 @@ def user_dashboard():
                 st.warning("Type a message before sending.")
 
         # ---------- Feedback loop ----------
-        # Show feedback buttons only if ticket is resolved and feedback is NULL / None
         if status == "resolved" and feedback is None:
             st.markdown("### Was this conversation helpful?")
             col1, col2 = st.columns(2)
@@ -462,14 +486,18 @@ def user_dashboard():
                     st.warning("You marked this conversation as not helpful. Support may follow up.")
                     safe_rerun()
         elif feedback == 1:
-            st.info("✅ You marked this conversation as **helpful**.")
+            st.info(" You marked this conversation as **helpful**.")
         elif feedback == 0:
-            st.warning("⚠️ You marked this conversation as **not helpful**. Support may follow up again.")
+            st.warning(" You marked this conversation as **not helpful**. Support may follow up again.")
 
 # =========================
 # Agent dashboard (support)
 # =========================
 def agent_dashboard():
+    # auto-refresh for live chat
+    if st_autorefresh:
+        st_autorefresh(interval=5000, key="support_refresh")
+
     st.sidebar.markdown("### Actions")
     if st.sidebar.button("Logout"):
         do_logout()
@@ -506,6 +534,7 @@ def agent_dashboard():
     st.subheader(f"Ticket: {t.get('title')} — {open_id}")
     st.write("Creator:", t.get("creator"))
     st.write("Status:", t.get("status"))
+    st.write("Created at:", t.get("created_at"))
     st.write("Description:")
     st.write(t.get("description"))
 
@@ -536,7 +565,6 @@ def agent_dashboard():
         if st.button("Use suggestion as reply"):
             added = add_message_to_db(open_id, st.session_state.auth["user"], ai_s)
             if added:
-                # mark as resolved, wait for feedback from user
                 set_ticket_status(open_id, status="resolved", needs_human=0)
                 st.success("Suggestion added as agent reply. Waiting for user feedback.")
                 safe_rerun()
@@ -549,7 +577,6 @@ def agent_dashboard():
         else:
             ok = add_message_to_db(open_id, st.session_state.auth["user"], reply_text.strip())
             if ok:
-                # mark as resolved; user will give feedback
                 set_ticket_status(open_id, status="resolved", needs_human=0)
                 st.success("Reply sent. Waiting for user feedback.")
                 safe_rerun()
@@ -558,9 +585,120 @@ def agent_dashboard():
 
     # Show feedback info if available
     if t.get("feedback") == 1:
-        st.success("User marked this conversation as **helpful** ✅")
+        st.success("User marked this conversation as **helpful** ")
     elif t.get("feedback") == 0:
-        st.warning("User marked this conversation as **not helpful** ❌ — consider following up.")
+        st.warning("User marked this conversation as **not helpful**  — consider following up.")
+
+# =========================
+# Admin dashboard  (UPDATED with tabs + pie chart)
+# =========================
+def admin_dashboard():
+    # auto-refresh for live stats
+    if st_autorefresh:
+        st_autorefresh(interval=8000, key="admin_refresh")
+
+    st.sidebar.markdown("### Actions")
+    if st.sidebar.button("Logout"):
+        do_logout()
+
+    st.title("Admin Dashboard")
+
+    tab_overview, tab_kb = st.tabs(["Overview & Feedback Analysis", "Knowledge Base"])
+
+    # ---- Overview & Feedback Analysis ----
+    with tab_overview:
+        # Ticket stats
+        c = conn.cursor()
+        c.execute("SELECT status, feedback FROM tickets")
+        rows = c.fetchall()
+        total = len(rows)
+        open_count = sum(1 for r in rows if r["status"] == "open")
+        resolved_count = sum(1 for r in rows if r["status"] == "resolved")
+        helpful = sum(1 for r in rows if r["feedback"] == 1)
+        not_helpful = sum(1 for r in rows if r["feedback"] == 0)
+        no_feedback = total - (helpful + not_helpful)
+
+        col1, col2, col3, col4, col5 = st.columns(5)
+        col1.metric("Total Tickets", total)
+        col2.metric("Open", open_count)
+        col3.metric("Resolved", resolved_count)
+        col4.metric("Helpful 👍", helpful)
+        col5.metric("Not Helpful 👎", not_helpful)
+
+        st.markdown("### Feedback Analysis (Pie Chart)")
+
+        if total == 0:
+            st.info("No tickets yet to analyze.")
+        else:
+            labels = []
+            sizes = []
+            if helpful > 0:
+                labels.append("Helpful")
+                sizes.append(helpful)
+            if not_helpful > 0:
+                labels.append("Not helpful")
+                sizes.append(not_helpful)
+            if no_feedback > 0:
+                labels.append("No feedback yet")
+                sizes.append(no_feedback)
+
+            if sizes:
+                fig, ax = plt.subplots()
+                ax.pie(sizes, labels=labels, autopct="%1.1f%%", startangle=90)
+                ax.axis("equal")  # Equal aspect ratio ensures that pie is drawn as a circle.
+                st.pyplot(fig)
+            else:
+                st.info("No feedback data available yet.")
+
+        st.markdown("---")
+        st.subheader("All Tickets (overview)")
+        try:
+            c.execute("SELECT id, title, creator, status, created_at, feedback FROM tickets ORDER BY created_at DESC")
+            all_t = c.fetchall()
+            if not all_t:
+                st.info("No tickets found.")
+            else:
+                for r in all_t:
+                    fb_str = "None"
+                    if r["feedback"] == 1:
+                        fb_str = "Helpful"
+                    elif r["feedback"] == 0:
+                        fb_str = "Not helpful"
+                    st.write(
+                        f"{r['created_at']} — **{r['title']}** "
+                        f"(ID: {r['id']}) — by **{r['creator']}** — status: **{r['status']}** — feedback: {fb_str}"
+                    )
+        except Exception as e:
+            st.error(f"Failed to load tickets overview: {e}")
+
+    # ---- Knowledge Base Tab ----
+    with tab_kb:
+        st.subheader("Knowledge Base Management")
+        st.caption(
+            "Upload new PDF/TXT/ docs to enrich the knowledge base. "
+            "If backend `add_to_chroma` is available, it will index automatically."
+        )
+
+        uploaded_files = st.file_uploader(
+            "Upload KB documents",
+            type=["pdf", "txt", "md"],
+            accept_multiple_files=True,
+            key="kb_upload",
+        )
+        if uploaded_files:
+            for f in uploaded_files:
+                save_path = pathlib.Path(KB_DIR) / f.name
+                with open(save_path, "wb") as fh:
+                    fh.write(f.getbuffer())
+                st.success(f"Saved KB file: {save_path}")
+                # Try to send into vector DB if backend supports it
+                if add_to_chroma:
+                    try:
+                        content = save_path.read_text(errors="ignore")
+                        add_to_chroma(content, f.name)
+                        st.info(f"Indexed into Chroma via backend: {f.name}")
+                    except Exception as e:
+                        st.warning(f"Could not index {f.name} into vector DB: {e}")
 
 # =========================
 # Entrypoint
@@ -577,6 +715,8 @@ def main():
             user_dashboard()
         elif role == "support":
             agent_dashboard()
+        elif role == "admin":
+            admin_dashboard()
         else:
             st.error("Unknown role. Log out and back in.")
             if st.button("Logout"):
