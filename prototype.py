@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
 import streamlit as st
-import matplotlib.pyplot as plt  # <-- for pie chart
+import matplotlib.pyplot as plt  # <-- for pie & bar charts
 
 # =========================
 # Optional auto-refresh helper
@@ -464,6 +464,7 @@ def user_dashboard():
                 ok = add_message_to_db(t_id, st.session_state.auth["user"], new_msg.strip())
                 if ok:
                     st.success("Message sent to support agent.")
+                    # user sending a new message → ticket pending again
                     set_ticket_status(t_id, status="open", needs_human=1)
                     safe_rerun()
                 else:
@@ -472,13 +473,15 @@ def user_dashboard():
                 st.warning("Type a message before sending.")
 
         # ---------- Feedback loop ----------
-        if status == "resolved" and feedback is None:
+        # Ticket should become RESOLVED ONLY when feedback is "helpful".
+        # Show feedback buttons when agent has replied (status='answered') and feedback is None.
+        if status == "answered" and feedback is None:
             st.markdown("### Was this conversation helpful?")
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("👍 Yes, helpful", key=f"fb_yes_{t_id}"):
-                    set_ticket_status(t_id, feedback=1)
-                    st.success("Thanks! You marked this conversation as helpful.")
+                    set_ticket_status(t_id, status="resolved", feedback=1, needs_human=0)
+                    st.success("Thanks! You marked this conversation as helpful. Ticket is now resolved.")
                     safe_rerun()
             with col2:
                 if st.button("👎 Not helpful", key=f"fb_no_{t_id}"):
@@ -565,7 +568,7 @@ def agent_dashboard():
         if st.button("Use suggestion as reply"):
             added = add_message_to_db(open_id, st.session_state.auth["user"], ai_s)
             if added:
-                set_ticket_status(open_id, status="resolved", needs_human=0)
+                set_ticket_status(open_id, status="answered", needs_human=0)
                 st.success("Suggestion added as agent reply. Waiting for user feedback.")
                 safe_rerun()
 
@@ -577,7 +580,7 @@ def agent_dashboard():
         else:
             ok = add_message_to_db(open_id, st.session_state.auth["user"], reply_text.strip())
             if ok:
-                set_ticket_status(open_id, status="resolved", needs_human=0)
+                set_ticket_status(open_id, status="answered", needs_human=0)
                 st.success("Reply sent. Waiting for user feedback.")
                 safe_rerun()
             else:
@@ -585,12 +588,12 @@ def agent_dashboard():
 
     # Show feedback info if available
     if t.get("feedback") == 1:
-        st.success("User marked this conversation as **helpful** ")
+        st.success("User marked this conversation as **helpful** ✅ (resolved)")
     elif t.get("feedback") == 0:
-        st.warning("User marked this conversation as **not helpful**  — consider following up.")
+        st.warning("User marked this conversation as **not helpful** ❌ — consider following up.")
 
 # =========================
-# Admin dashboard  (UPDATED with tabs + pie chart)
+# Admin dashboard  (tabs + compact bar & pie charts side-by-side)
 # =========================
 def admin_dashboard():
     # auto-refresh for live stats
@@ -612,8 +615,9 @@ def admin_dashboard():
         c.execute("SELECT status, feedback FROM tickets")
         rows = c.fetchall()
         total = len(rows)
-        open_count = sum(1 for r in rows if r["status"] == "open")
         resolved_count = sum(1 for r in rows if r["status"] == "resolved")
+        pending_count = total - resolved_count   # anything not resolved is considered pending
+        open_count = sum(1 for r in rows if r["status"] == "open")
         helpful = sum(1 for r in rows if r["feedback"] == 1)
         not_helpful = sum(1 for r in rows if r["feedback"] == 0)
         no_feedback = total - (helpful + not_helpful)
@@ -625,58 +629,56 @@ def admin_dashboard():
         col4.metric("Helpful 👍", helpful)
         col5.metric("Not Helpful 👎", not_helpful)
 
-        st.markdown("### Feedback Analysis (Pie Chart)")
+        st.markdown("### Ticket Insights")
 
-        if total == 0:
-            st.info("No tickets yet to analyze.")
-        else:
-            labels = []
-            sizes = []
-            if helpful > 0:
-                labels.append("Helpful")
-                sizes.append(helpful)
-            if not_helpful > 0:
-                labels.append("Not helpful")
-                sizes.append(not_helpful)
-            if no_feedback > 0:
-                labels.append("No feedback yet")
-                sizes.append(no_feedback)
+        chart_col1, chart_col2 = st.columns(2)
 
-            if sizes:
-                fig, ax = plt.subplots()
-                ax.pie(sizes, labels=labels, autopct="%1.1f%%", startangle=90)
-                ax.axis("equal")  # Equal aspect ratio ensures that pie is drawn as a circle.
-                st.pyplot(fig)
+        # ---- Bar chart: Resolved vs Pending (left column) ----
+        with chart_col1:
+            st.caption("Ticket Resolution Status")
+            if total == 0:
+                st.info("No tickets yet to show in bar chart.")
             else:
-                st.info("No feedback data available yet.")
+                labels_bar = ["Resolved", "Pending"]
+                values_bar = [resolved_count, pending_count]
+                fig_bar, ax_bar = plt.subplots(figsize=(4, 3))  # compact size
+                ax_bar.bar(labels_bar, values_bar)
+                for i, v in enumerate(values_bar):
+                    ax_bar.text(i, v + 0.1, str(v), ha="center", va="bottom")
+                ax_bar.set_ylabel("Number of Tickets")
+                st.pyplot(fig_bar)
 
-        st.markdown("---")
-        st.subheader("All Tickets (overview)")
-        try:
-            c.execute("SELECT id, title, creator, status, created_at, feedback FROM tickets ORDER BY created_at DESC")
-            all_t = c.fetchall()
-            if not all_t:
-                st.info("No tickets found.")
+        # ---- Feedback pie chart (right column) ----
+        with chart_col2:
+            st.caption("Feedback Analysis")
+            if total == 0:
+                st.info("No tickets yet to analyze.")
             else:
-                for r in all_t:
-                    fb_str = "None"
-                    if r["feedback"] == 1:
-                        fb_str = "Helpful"
-                    elif r["feedback"] == 0:
-                        fb_str = "Not helpful"
-                    st.write(
-                        f"{r['created_at']} — **{r['title']}** "
-                        f"(ID: {r['id']}) — by **{r['creator']}** — status: **{r['status']}** — feedback: {fb_str}"
-                    )
-        except Exception as e:
-            st.error(f"Failed to load tickets overview: {e}")
+                labels = []
+                sizes = []
+                if helpful > 0:
+                    labels.append("Helpful")
+                    sizes.append(helpful)
+                if not_helpful > 0:
+                    labels.append("Not helpful")
+                    sizes.append(not_helpful)
+                if no_feedback > 0:
+                    labels.append("No feedback yet")
+                    sizes.append(no_feedback)
+
+                if sizes:
+                    fig, ax = plt.subplots(figsize=(3.5, 3.5))  # compact pie chart
+                    ax.pie(sizes, labels=labels, autopct="%1.1f%%", startangle=90)
+                    ax.axis("equal")
+                    st.pyplot(fig)
+                else:
+                    st.info("No feedback data available yet.")
 
     # ---- Knowledge Base Tab ----
     with tab_kb:
         st.subheader("Knowledge Base Management")
         st.caption(
             "Upload new PDF/TXT/ docs to enrich the knowledge base. "
-            "If backend `add_to_chroma` is available, it will index automatically."
         )
 
         uploaded_files = st.file_uploader(
